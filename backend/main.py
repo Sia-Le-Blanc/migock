@@ -42,22 +42,19 @@ def auto_collect_rice_price():
 # --- [설정] 2. 서버 수명주기 관리 (켜질 때 스케줄러 시작) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 서버 켜질 때 실행
     print("🚀 서버 가동! 스케줄러를 시작합니다.")
     
     scheduler = BackgroundScheduler()
-    
-    # [중요] 테스트용: 1분마다 실행 (나중엔 'cron'으로 매일 아침으로 바꿀 예정)
     scheduler.add_job(auto_collect_rice_price, 'interval', minutes=1, id='rice_job')
-    
     scheduler.start()
     
-    yield # 여기서 서버가 계속 돌아감
+    # 👇 [추가] 켜자마자 일단 한 번 실행해! (이 줄을 추가하세요)
+    auto_collect_rice_price()
     
-    # 서버 꺼질 때 실행
+    yield # 서버 작동 중...
+    
     print("💤 서버 종료. 스케줄러도 끕니다.")
     scheduler.shutdown()
-
 # --- 3. FastAPI 앱 설정 ---
 models.Base.metadata.create_all(bind=database.engine)
 app = FastAPI(lifespan=lifespan) # 수명주기(lifespan) 등록

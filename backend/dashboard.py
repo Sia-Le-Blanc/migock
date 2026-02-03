@@ -1,100 +1,128 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 from database import get_db
 from models import RicePrice
 
-# 1. 설정 및 디자인 (부동산114 스타일 유지)
-st.set_page_config(page_title="미곡(MIGOCK) 통합 관제", page_icon="🌾", layout="wide")
+# 1. 페이지 설정
+st.set_page_config(page_title="MIGOCK 지역별 시세", page_icon="🌾", layout="wide")
 
 st.markdown("""
     <style>
         html, body, [class*="css"] { font-family: 'Malgun Gothic', sans-serif; }
         header[data-testid="stHeader"] { border-bottom: 2px solid #004094; }
-        div[data-testid="stMetric"], button { border-radius: 0px !important; }
-        div[data-testid="stMetric"] { background-color: #f8f9fa; border: 1px solid #d1d1d1; }
-        div[data-testid="stMetricValue"] { color: #004094; font-weight: 700; }
-        .block-container { padding-top: 2rem; }
+        .block-container { padding-top: 1rem; }
     </style>
 """, unsafe_allow_html=True)
 
-# 2. 데이터 로드
+# 2. 데이터 로드 및 "강력한" 정제
 def load_data():
     db = next(get_db())
     query = db.query(RicePrice).order_by(RicePrice.created_at.desc())
     df = pd.read_sql(query.statement, db.bind)
     db.close()
-    return df
-
-# 3. 사이드바 메뉴 (페이지 분기)
-st.sidebar.title("MIGOCK System")
-page = st.sidebar.radio("메뉴 선택", ["통합 대시보드 (전국)", "🗺️ 지역별 시세 지도"])
-st.sidebar.markdown("---")
-
-df = load_data()
-
-# --- 페이지 1: 기존 통합 대시보드 ---
-if page == "통합 대시보드 (전국)":
-    st.title("🌾 전국 도매 시세 (평균)")
     
-    # '전국 평균' 데이터만 필터링
-    avg_df = df[df['location'] == '평균']
+    if df.empty: return pd.DataFrame(), 0
+
+    # (1) 화이트리스트 필터링
+    VALID_REGIONS = [
+        "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+        "수원", "춘천", "청주", "전주", "포항", "제주", "순천", "안동", "창원", 
+        "평균"
+    ]
     
-    if not avg_df.empty:
-        latest = avg_df.iloc[0]
-        # (기존 KPI 및 차트 코드 유지)
-        st.metric("오늘의 평균 시세", f"{latest['price']:,}원")
-        st.line_chart(avg_df.set_index('created_at')['price'])
-        st.dataframe(avg_df, use_container_width=True)
+    # 공백 제거 후 필터링 (가장 흔한 실수 방지)
+    df['location'] = df['location'].astype(str).str.strip()
+    clean_df = df[df['location'].isin(VALID_REGIONS)].copy()
+    
+    if clean_df.empty: return pd.DataFrame(), 0
+
+    # (2) [핵심] 가격 데이터 강제 정수 변환 (에러 방지) ⭐
+    clean_df['price'] = pd.to_numeric(clean_df['price'], errors='coerce').fillna(0).astype(int)
+
+    # (3) 최근 데이터 추출
+    latest_timestamp = clean_df.iloc[0]['created_at']
+    recent_df = clean_df[clean_df['created_at'] >= latest_timestamp - pd.Timedelta(minutes=10)].copy()
+    
+    # (4) 중복 제거
+    unique_df = recent_df.sort_values('created_at', ascending=False).drop_duplicates(subset=['location'])
+    
+    # (5) 평균값 계산
+    avg_row = unique_df[unique_df['location'] == '평균']
+    avg_price = avg_row.iloc[0]['price'] if not avg_row.empty else 0
+    
+    # (6) 지역 데이터만 남김
+    local_df = unique_df[unique_df['location'] != '평균'].copy()
+    
+    return local_df, avg_price
+
+# --- 메인 화면 ---
+st.title("📊 지역별 쌀 시세 랭킹")
+st.markdown("---")
+
+df, avg_price = load_data()
+
+if not df.empty:
+    # A. 상단 KPI
+    col1, col2, col3 = st.columns(3)
+    
+    max_row = df.loc[df['price'].idxmax()]
+    min_row = df.loc[df['price'].idxmin()]
+
+    col1.metric("전국 평균", f"{avg_price:,}원")
+    col2.metric("최고가 지역", f"{max_row['location']}", f"{max_row['price']:,}원")
+    col3.metric("최저가 지역", f"{min_row['location']}", f"{min_row['price']:,}원")
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # B. 막대그래프 (안정성 강화 버전)
+    st.subheader("🏆 가격 높은 순 랭킹 (실시간)")
+    
+    # 색상 설정
+    df['color'] = df['price'].apply(lambda x: '#FF4B4B' if x > avg_price else '#1C83E1')
+    
+    # [핵심] Y축 범위 자동 보정 (안전장치)
+    # 데이터가 1개뿐이거나 가격이 다 똑같을 때 그래프가 깨지는 걸 방지합니다.
+    p_min = df['price'].min()
+    p_max = df['price'].max()
+    
+    if p_min == p_max: # 가격이 다 똑같으면?
+        y_domain = [p_min - 500, p_max + 500]
     else:
-        st.info("데이터가 없습니다. 크롤러가 곧 수집합니다.")
+        y_domain = [p_min - 500, p_max + 1000]
 
-# --- 페이지 2: 지역별 시세 지도 (NEW!) ---
-elif page == "🗺️ 지역별 시세 지도":
-    st.title("🗺️ 지역별 실시간 시세 현황")
-    
-    if not df.empty:
-        # 가장 최근 수집된 시간(오늘자)의 데이터만 추출
-        latest_time = df.iloc[0]['created_at']
-        # 최근 시간과 10분 이내 차이나는 데이터들만(동시간대 수집본)
-        latest_df = df[df['created_at'] >= latest_time - pd.Timedelta(minutes=10)].copy()
-        
-        # '평균' 제외하고 순수 지역만
-        local_df = latest_df[latest_df['location'] != '평균']
+    # 1. 기본 차트
+    base = alt.Chart(df).encode(
+        # X축: 지역명 (가나다순이 아니라 가격순 정렬 '-y')
+        x=alt.X('location', sort='-y', title=None, axis=alt.Axis(labelAngle=0, labelFontSize=12)),
+        # Y축: 가격 (Auto Scale 적용)
+        y=alt.Y('price', title='도매가격(원)', scale=alt.Scale(domain=y_domain))
+    )
 
-        # 1. 바 차트로 비교 (비싼 순서대로)
-        st.subheader("📊 지역별 가격 순위 (비싼 순)")
-        st.bar_chart(local_df.set_index('location')['price'])
-        
-        # 2. 지도 시각화 (좌표 매핑)
-        st.subheader("📍 전국 시세 지도")
-        
-        # 주요 도시 좌표 하드코딩 (Enterprise급 꼼수)
-        coords = {
-            "서울": [37.5665, 126.9780], "부산": [35.1796, 129.0756],
-            "대구": [35.8714, 128.6014], "인천": [37.4563, 126.7052],
-            "광주": [35.1595, 126.8526], "대전": [36.3504, 127.3845],
-            "울산": [35.5384, 129.3114], "수원": [37.2636, 127.0286],
-            "춘천": [37.8814, 127.7298], "청주": [36.6424, 127.4890],
-            "전주": [35.8242, 127.1480], "제주": [33.4996, 126.5312]
-        }
-        
-        # 데이터프레임에 위도/경도 컬럼 추가
-        map_data = []
-        for idx, row in local_df.iterrows():
-            loc = row['location']
-            if loc in coords:
-                map_data.append({
-                    "lat": coords[loc][0],
-                    "lon": coords[loc][1],
-                    "price": row['price'], # 점 크기로 활용 가능
-                    "location": loc
-                })
-        
-        if map_data:
-            st.map(pd.DataFrame(map_data), size=2000, zoom=6)
-            st.caption("※ 원의 위치는 해당 도매시장의 위치를 나타냅니다.")
-        else:
-            st.warning("지도에 표시할 지역 데이터가 아직 수집되지 않았습니다.")
-            
-        # 3. 상세 테이블
-        st.dataframe(local_df[['location', 'price', 'created_at']], use_container_width=True)
+    # 2. 막대 (Bars)
+    bars = base.mark_bar().encode(
+        color=alt.Color('color', scale=None),
+        tooltip=['location', 'price']
+    )
+
+    # 3. 텍스트 (Labels)
+    text = base.mark_text(
+        dy=-10, # 막대 위로 10픽셀 띄우기
+        fontSize=12,
+        fontWeight='bold'
+    ).encode(
+        text=alt.Text('price', format=',')
+    )
+
+    # 4. 합체
+    chart = alt.layer(bars, text).properties(height=450)
+    st.altair_chart(chart, use_container_width=True)
+
+    # C. 데이터 확인용 (디버깅)
+    with st.expander("🔍 데이터가 제대로 들어왔는지 확인하기"):
+        st.write("아래 표에 '가격'이 숫자로 잘 보이는지 확인하세요.")
+        st.dataframe(df[['location', 'price', 'created_at']], use_container_width=True)
+
+else:
+    st.error("❌ 표시할 데이터가 없습니다.")
+    st.info("데이터베이스에 '서울', '부산' 같은 지역 데이터가 저장되어 있는지 확인해주세요.")
